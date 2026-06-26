@@ -4,6 +4,8 @@ import logging
 from datetime import datetime, timezone
 from typing import Callable
 
+from utils.helpers import normalize_exchange_key
+
 logger = logging.getLogger(__name__)
 
 
@@ -41,7 +43,7 @@ class ExchangeAPIService:
         return None
 
     async def get_earliest_date(self, exchange: str, base: str, quote: str) -> datetime | None:
-        key = exchange.lower().strip().replace(' ', '').replace('-', '')
+        key = normalize_exchange_key(exchange)
         handler = self.handlers.get(key)
         if not handler:
             return None

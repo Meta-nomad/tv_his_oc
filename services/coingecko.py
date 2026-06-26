@@ -1,119 +1,99 @@
-"""
-CoinGecko API service.
-Resolves ticker -> coin_id and fetches exchange tickers.
-"""
-
+import aiohttp
 import asyncio
 import logging
-from datetime import datetime
-from typing import Optional
+from typing import Any
 
-import aiohttp
-
-from config import COINGECKO_BASE_URL
+BASE_URL = 'https://api.coingecko.com/api/v3'
 
 logger = logging.getLogger(__name__)
 
-HEADERS = {
-    "Accept": "application/json",
-    "User-Agent": "TradingViewHistoryBot/1.0",
-}
 
-# Rate limit: CoinGecko free tier ~30 req/min
-_REQUEST_DELAY = 1.2  # seconds between requests
+class CoinGeckoService:
+    def __init__(self, cache, session: aiohttp.ClientSession):
+        self.cache = cache
+        self._session = session
 
-
-async def _get(session: aiohttp.ClientSession, url: str, params: dict = None) -> Optional[dict | list]:
-    try:
-        async with session.get(url, params=params, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-            if resp.status == 429:
-                logger.warning("CoinGecko rate limit hit, sleeping 10s")
-                await asyncio.sleep(10)
-                async with session.get(url, params=params, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=15)) as resp2:
-                    if resp2.status != 200:
+    async def _get(self, url: str, params: dict | None = None, retries: int = 3):
+        for attempt in range(retries):
+            try:
+                async with self._session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                    if resp.status == 429:
+                        wait = min(60 * (attempt + 1), 180)
+                        logger.warning('CoinGecko 429, waiting %ds', wait)
+                        await asyncio.sleep(wait)
+                        continue
+                    if resp.status != 200:
+                        logger.warning('CoinGecko %d for %s', resp.status, url)
                         return None
-                    return await resp2.json()
-            if resp.status != 200:
-                logger.warning("CoinGecko %s -> HTTP %s", url, resp.status)
-                return None
-            return await resp.json()
-    except Exception as e:
-        logger.error("CoinGecko request error: %s", e)
+                    return await resp.json()
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                logger.warning('CoinGecko request failed (%s): %s', url, e)
+                if attempt < retries - 1:
+                    await asyncio.sleep(2 ** attempt)
+                else:
+                    return None
         return None
 
+    async def search_coins(self, query: str) -> list[dict]:
+        cache_key = f'cg_search_{query.lower()}'
+        cached = self.cache.get(cache_key)
+        if cached:
+            return cached
 
-async def search_coin_id(session: aiohttp.ClientSession, ticker: str) -> Optional[str]:
-    """
-    Find CoinGecko coin_id by ticker symbol.
-    Returns the best match coin_id or None.
-    """
-    url = f"{COINGECKO_BASE_URL}/search"
-    data = await _get(session, url, {"query": ticker})
-    if not data or "coins" not in data:
+        data = await self._get(f'{BASE_URL}/search', {'query': query})
+        if data is None:
+            return []
+        coins = data.get('coins', [])
+        self.cache.set(cache_key, coins, ttl=3600)
+        return coins
+
+    async def get_coin_info(self, coin_id: str) -> dict | None:
+        cache_key = f'cg_coin_info_{coin_id}'
+        cached = self.cache.get(cache_key)
+        if cached:
+            return cached
+
+        data = await self._get(f'{BASE_URL}/coins/{coin_id}')
+        if data is None:
+            return None
+        self.cache.set(cache_key, data, ttl=3600)
+        return data
+
+    async def get_coin_tickers(self, coin_id: str) -> list[dict]:
+        cache_key = f'cg_tickers_{coin_id}'
+        cached = self.cache.get(cache_key)
+        if cached:
+            return cached
+
+        all_tickers: list[dict] = []
+        page = 1
+        while page <= 10:
+            data = await self._get(
+                f'{BASE_URL}/coins/{coin_id}/tickers',
+                {'page': page, 'limit': 100},
+            )
+            if data is None:
+                break
+            tickers = data.get('tickers', [])
+            if not tickers:
+                break
+            all_tickers.extend(tickers)
+            page += 1
+
+        self.cache.set(cache_key, all_tickers, ttl=3600)
+        return all_tickers
+
+    async def resolve_coin(self, symbol: str) -> dict | None:
+        symbol = symbol.upper()
+
+        search_results = await self.search_coins(symbol)
+        exact = [c for c in search_results if c.get('symbol', '').upper() == symbol]
+        exact.sort(key=lambda x: x.get('market_cap_rank', 9999) or 9999)
+
+        if exact:
+            coin_id = exact[0]['id']
+            info = await self.get_coin_info(coin_id)
+            if info:
+                return info
+
         return None
-
-    coins = data["coins"]
-    ticker_upper = ticker.upper()
-
-    # Exact symbol match
-    for coin in coins:
-        if coin.get("symbol", "").upper() == ticker_upper:
-            return coin["id"]
-
-    return None
-
-
-async def get_coin_details(session: aiohttp.ClientSession, coin_id: str) -> Optional[dict]:
-    """Get full coin details including genesis date."""
-    url = f"{COINGECKO_BASE_URL}/coins/{coin_id}"
-    params = {
-        "localization": "false",
-        "tickers": "false",
-        "market_data": "false",
-        "community_data": "false",
-        "developer_data": "false",
-    }
-    return await _get(session, url, params)
-
-
-async def get_coin_tickers(session: aiohttp.ClientSession, coin_id: str) -> list[dict]:
-    """
-    Fetch all exchange tickers for a coin from CoinGecko (paginated).
-    Returns list of ticker dicts with exchange info.
-    """
-    all_tickers = []
-    page = 1
-    while True:
-        url = f"{COINGECKO_BASE_URL}/coins/{coin_id}/tickers"
-        params = {"page": page, "per_page": 100, "include_exchange_logo": "false", "depth": "false"}
-        data = await _get(session, url, params)
-        if not data or "tickers" not in data:
-            break
-        tickers = data["tickers"]
-        if not tickers:
-            break
-        all_tickers.extend(tickers)
-        # CoinGecko returns max 100 per page; if we got less, we're done
-        if len(tickers) < 100:
-            break
-        page += 1
-        await asyncio.sleep(_REQUEST_DELAY)
-
-    return all_tickers
-
-
-async def get_earliest_date_from_market_chart(
-    session: aiohttp.ClientSession, coin_id: str
-) -> Optional[str]:
-    """
-    Get earliest available price date from CoinGecko market chart (max history).
-    """
-    url = f"{COINGECKO_BASE_URL}/coins/{coin_id}/market_chart"
-    params = {"vs_currency": "usd", "days": "max", "interval": "daily"}
-    data = await _get(session, url, params)
-    if not data or "prices" not in data or not data["prices"]:
-        return None
-
-    earliest_ts = data["prices"][0][0]  # milliseconds
-    dt = datetime.utcfromtimestamp(earliest_ts / 1000)
-    return dt.strftime("%Y-%m-%d")

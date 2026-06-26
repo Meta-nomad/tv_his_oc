@@ -1,161 +1,211 @@
-"""
-CryptoCompare API service.
-Used to determine the earliest available OHLCV data per exchange
-and to score hourly chart continuity (gap ratio).
-"""
-
-import logging
-import math
-from datetime import datetime, timezone, timedelta
-from typing import Optional
-
 import aiohttp
+import asyncio
+import logging
+import time
+from datetime import datetime, timezone
+from typing import Any
 
-from config import CRYPTOCOMPARE_BASE_URL, CRYPTOCOMPARE_API_KEY
+BASE_URL = 'https://min-api.cryptocompare.com/data'
+MAX_BACKTRACK_SECONDS = 365 * 15 * 86400
 
 logger = logging.getLogger(__name__)
 
-# How many recent hourly candles to fetch for gap analysis.
-# 2000 hours ≈ 83 days — enough to get a solid continuity score.
-HOURLY_SAMPLE_SIZE = 2000
 
+class CryptoCompareService:
+    def __init__(self, cache, session: aiohttp.ClientSession, api_key: str = ''):
+        self.cache = cache
+        self._session = session
+        self.api_key = api_key
+        self._blocked = False
 
-def _headers() -> dict:
-    h = {"Accept": "application/json", "User-Agent": "TradingViewHistoryBot/1.0"}
-    if CRYPTOCOMPARE_API_KEY:
-        h["authorization"] = f"Apikey {CRYPTOCOMPARE_API_KEY}"
-    return h
+    def _headers(self) -> dict:
+        if self.api_key:
+            return {'authorization': f'Apikey {self.api_key}'}
+        return {}
 
-
-async def _get(session: aiohttp.ClientSession, url: str, params: dict = None) -> Optional[dict]:
-    try:
-        async with session.get(
-            url, params=params, headers=_headers(), timeout=aiohttp.ClientTimeout(total=20)
-        ) as resp:
-            if resp.status != 200:
-                logger.warning("CryptoCompare %s -> HTTP %s", url, resp.status)
-                return None
-            data = await resp.json()
-            if data.get("Response") == "Error":
-                logger.debug("CryptoCompare error: %s", data.get("Message"))
-                return None
-            return data
-    except Exception as e:
-        logger.error("CryptoCompare request error: %s", e)
+    async def _get(self, endpoint: str, params: dict | None = None, retries: int = 2):
+        if self._blocked:
+            return None
+        url = f'{BASE_URL}/{endpoint}'
+        headers = self._headers()
+        for attempt in range(retries):
+            try:
+                async with self._session.get(url, params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    if resp.status == 401:
+                        self._blocked = True
+                        return None
+                    if resp.status != 200:
+                        logger.debug('CryptoCompare %d for %s', resp.status, url)
+                        return None
+                    data = await resp.json()
+                    if data.get('Response') == 'Error':
+                        logger.debug('CryptoCompare error: %s', data.get('Message'))
+                        return None
+                    return data
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                logger.debug('CryptoCompare request failed: %s', e)
+                if attempt < retries - 1:
+                    await asyncio.sleep(2 ** attempt)
         return None
 
+    async def get_earliest_date(self, fsym: str, tsym: str, exchange: str | None = None) -> datetime | None:
+        cache_key = f'cc_earliest_{fsym}_{tsym}_{exchange or "agg"}'
+        cached = self.cache.get(cache_key)
+        if cached:
+            return datetime.fromisoformat(cached)
 
-async def get_all_history_alldata(
-    session: aiohttp.ClientSession, base: str, quote: str, exchange: str
-) -> Optional[datetime]:
-    """
-    Fetch full daily history with allData=true, return earliest valid date.
-    A bar is considered valid if it has non-zero volume.
-    """
-    url = f"{CRYPTOCOMPARE_BASE_URL}/v2/histoday"
-    params = {
-        "fsym": base.upper(),
-        "tsym": quote.upper(),
-        "e": exchange,
-        "limit": 2000,
-        "allData": "true",
-    }
-    data = await _get(session, url, params)
-    if not data or "Data" not in data or "Data" not in data["Data"]:
+        date = await self._try_all_data(fsym, tsym, exchange)
+        if not date:
+            date = await self._binary_search(fsym, tsym, exchange)
+        if not date:
+            date = await self._try_histohour(fsym, tsym, exchange)
+
+        if date:
+            self.cache.set(cache_key, date.isoformat(), ttl=86400)
+        return date
+
+    async def _try_all_data(self, fsym: str, tsym: str, exchange: str | None) -> datetime | None:
+        params: dict[str, Any] = {
+            'fsym': fsym.upper(),
+            'tsym': tsym.upper(),
+            'limit': 2000,
+            'allData': 'true',
+        }
+        if exchange:
+            params['e'] = exchange
+
+        data = await self._get('v2/histoday', params)
+        if not data:
+            return None
+
+        prices = data.get('Data', {}).get('Data', [])
+        if not prices:
+            return None
+
+        for p in prices:
+            if p.get('high', 0) or p.get('low', 0) or p.get('close', 0):
+                return datetime.fromtimestamp(p['time'], tz=timezone.utc)
         return None
 
-    bars = data["Data"]["Data"]
-    if not bars:
+    async def _binary_search(self, fsym: str, tsym: str, exchange: str | None) -> datetime | None:
+        now = int(time.time())
+        current_ts = now
+        earliest_ts = now
+        found = False
+
+        while current_ts > now - MAX_BACKTRACK_SECONDS:
+            params: dict[str, Any] = {
+                'fsym': fsym.upper(),
+                'tsym': tsym.upper(),
+                'limit': 2000,
+                'toTs': current_ts,
+            }
+            if exchange:
+                params['e'] = exchange
+
+            data = await self._get('v2/histoday', params)
+            if not data:
+                break
+
+            prices = data.get('Data', {}).get('Data', [])
+            if not prices:
+                break
+
+            first_nonzero = None
+            for p in prices:
+                if p.get('high', 0) or p.get('low', 0) or p.get('close', 0):
+                    first_nonzero = p
+                    break
+
+            if first_nonzero is None:
+                if found:
+                    break
+                current_ts -= 2000 * 86400
+                continue
+
+            found = True
+            earliest_ts = first_nonzero['time']
+
+            if first_nonzero is prices[0] and len(prices) >= 2000:
+                current_ts = earliest_ts
+            else:
+                break
+
+        if found:
+            return datetime.fromtimestamp(earliest_ts, tz=timezone.utc)
         return None
 
-    for bar in bars:
-        if (bar.get("volumefrom", 0) > 0 or bar.get("volumeto", 0) > 0) and bar.get("time", 0) > 0:
-            return datetime.fromtimestamp(bar["time"], tz=timezone.utc)
+    async def _try_histohour(self, fsym: str, tsym: str, exchange: str | None) -> datetime | None:
+        params: dict[str, Any] = {
+            'fsym': fsym.upper(),
+            'tsym': tsym.upper(),
+            'limit': 2000,
+            'toTs': int(time.time()),
+        }
+        if exchange:
+            params['e'] = exchange
 
-    return None
+        data = await self._get('v2/histohour', params)
+        if not data:
+            return None
 
+        prices = data.get('Data', {}).get('Data', [])
+        if not prices:
+            return None
 
-def _count_hourly_gaps(bars: list[dict]) -> tuple[int, int]:
-    """
-    Given a list of hourly bars (each with a 'time' unix timestamp),
-    count how many expected 1-hour slots are missing.
+        for p in prices:
+            if p.get('high', 0) or p.get('low', 0) or p.get('close', 0):
+                return datetime.fromtimestamp(p['time'], tz=timezone.utc)
+        return None
 
-    Returns (gap_count, expected_total).
+    async def check_continuity(self, fsym: str, tsym: str, exchange: str | None = None, hours: int = 2000) -> tuple[int, float]:
+        cache_key = f'cc_continuity_{fsym}_{tsym}_{exchange or "agg"}_{hours}'
+        cached = self.cache.get(cache_key)
+        if cached:
+            return tuple(cached)
 
-    A 'gap' is any slot between consecutive bars where the timestamp
-    jump is more than 1 hour (3600 seconds). We also count zero-volume
-    bars as soft gaps (weighted 0.5) to penalise dead periods.
-    """
-    if len(bars) < 2:
-        return 0, 1
+        params: dict[str, Any] = {
+            'fsym': fsym.upper(),
+            'tsym': tsym.upper(),
+            'limit': min(hours, 2000),
+        }
+        if exchange:
+            params['e'] = exchange
 
-    # Filter to bars with actual timestamps
-    times = sorted(b["time"] for b in bars if b.get("time", 0) > 0)
-    if len(times) < 2:
-        return 0, 1
+        data = await self._get('v2/histohour', params)
+        if not data:
+            return (999, 0.0)
 
-    first_ts = times[0]
-    last_ts = times[-1]
-    expected_slots = max(1, (last_ts - first_ts) // 3600)
+        prices = data.get('Data', {}).get('Data', [])
+        if not prices:
+            return (999, 0.0)
 
-    # Count hard gaps: consecutive timestamps differ by > 1 hour
-    hard_gaps = 0
-    for i in range(1, len(times)):
-        diff_hours = (times[i] - times[i - 1]) / 3600
-        if diff_hours > 1.5:  # allow small rounding
-            # Each missing hour counts as one gap slot
-            hard_gaps += int(diff_hours) - 1
+        gaps = 0
+        total_volume = 0.0
+        nonzero_count = 0
+        flat_candles = 0
 
-    # Count zero-volume bars as soft gaps (each counts as 0.5 of a gap)
-    zero_vol_count = sum(
-        1 for b in bars
-        if b.get("volumefrom", 0) == 0 and b.get("volumeto", 0) == 0
-    )
-    soft_gap_contribution = zero_vol_count * 0.5
+        for i in range(1, len(prices)):
+            curr = prices[i]
+            prev = prices[i - 1]
 
-    total_gaps = hard_gaps + soft_gap_contribution
-    return total_gaps, expected_slots
+            vol = float(curr.get('volumeto', 0) or 0)
+            if vol > 0:
+                total_volume += vol
+                nonzero_count += 1
 
+            time_diff = curr['time'] - prev['time']
+            if time_diff > 7200:
+                gaps += 1
 
-async def get_hourly_gap_score(
-    session: aiohttp.ClientSession, base: str, quote: str, exchange: str
-) -> float:
-    """
-    Fetch the most recent HOURLY_SAMPLE_SIZE hourly candles for a pair on an exchange
-    and return a gap_ratio in [0.0, 1.0]:
+            high = float(curr.get('high', 0) or 0)
+            low = float(curr.get('low', 0) or 0)
+            close = float(curr.get('close', 0) or 0)
+            if high == low == close and close > 0:
+                flat_candles += 1
 
-        gap_ratio = gaps / expected_slots
+        avg_volume = total_volume / max(nonzero_count, 1)
+        score = gaps * 100 + flat_candles * 10
 
-    0.0 = perfect, no gaps at all.
-    1.0 = completely discontinuous data.
-
-    Returns 1.0 (worst possible) if data cannot be fetched, so
-    exchanges with missing hourly data are naturally deprioritised.
-    """
-    url = f"{CRYPTOCOMPARE_BASE_URL}/v2/histohour"
-    params = {
-        "fsym": base.upper(),
-        "tsym": quote.upper(),
-        "e": exchange,
-        "limit": HOURLY_SAMPLE_SIZE,
-    }
-    data = await _get(session, url, params)
-    if not data or "Data" not in data or "Data" not in data["Data"]:
-        logger.debug("No hourly data for %s/%s on %s", base, quote, exchange)
-        return 1.0
-
-    bars = data["Data"]["Data"]
-    if not bars:
-        return 1.0
-
-    gaps, expected = _count_hourly_gaps(bars)
-    if expected == 0:
-        return 1.0
-
-    ratio = gaps / expected
-    ratio = min(ratio, 1.0)  # clamp to [0, 1]
-    logger.debug(
-        "Hourly gap score for %s/%s on %s: %.4f (gaps=%s, expected=%d)",
-        base, quote, exchange, ratio, gaps, expected,
-    )
-    return ratio
+        self.cache.set(cache_key, (score, avg_volume), ttl=86400)
+        return (score, avg_volume)
