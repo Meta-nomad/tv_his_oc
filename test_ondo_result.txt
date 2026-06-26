@@ -1,0 +1,5 @@
+best_pair=BINANCE:ONDOUSDT
+best_exchange=Binance
+best_date=2025-04-11 00:00:00+00:00
+quote=USDT
+alternatives=[{'pair': 'HTX:ONDOUSDT', 'exchange': 'HTX', 'date': '2026-06-25T16:00:00+00:00'}, {'pair': 'BYBIT:ONDOUSDT', 'exchange': 'Bybit', 'date': '2026-06-26T00:00:00+00:00'}, {'pair': 'GATEIO:ONDOUSDT', 'exchange': 'Gate.io', 'date': '2026-06-26T00:00:00+00:00'}]

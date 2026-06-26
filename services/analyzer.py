@@ -16,8 +16,6 @@ from utils.helpers import (
 )
 
 USDT_CREATION = datetime(2014, 10, 6, tzinfo=timezone.utc)
-PREFERRED_QUOTES_PRE_USDT = ['USD', 'USDC', 'EUR', 'BTC', 'ETH', 'USDT']
-PREFERRED_QUOTES_POST_USDT = ['USDT', 'USD', 'USDC', 'BTC', 'ETH', 'EUR']
 
 logger = logging.getLogger(__name__)
 
@@ -123,26 +121,29 @@ class Analyzer:
             exchange_pairs[ex_key][key] = max(exchange_pairs[ex_key].get(key, 0), vol)
 
         predates_usdt = genesis_date is not None and genesis_date < USDT_CREATION
-        priority = PREFERRED_QUOTES_PRE_USDT if predates_usdt else PREFERRED_QUOTES_POST_USDT
+        search_quotes = ['USD', 'USDC', 'USDT'] if predates_usdt else ['USDT', 'USD', 'USDC']
 
-        tasks: list[asyncio.Task] = []
-        for exchange, pairs in exchange_pairs.items():
-            available = [q for (_b, q) in pairs.keys()]
-            chosen = self._pick_quote(available, priority)
-            if not chosen:
-                continue
-            task = asyncio.ensure_future(
-                self._evaluate(exchange, ticker, chosen, pairs)
-            )
-            tasks.append(task)
+        exchange_data = []
+        for sq in search_quotes:
+            tasks: list[asyncio.Task] = []
+            for exchange, pairs in exchange_pairs.items():
+                if (ticker, sq) not in pairs:
+                    continue
+                task = asyncio.ensure_future(
+                    self._evaluate(exchange, ticker, sq, pairs)
+                )
+                tasks.append(task)
+            if tasks:
+                results = await asyncio.gather(*tasks)
+                exchange_data = [r for r in results if r is not None]
+                if exchange_data:
+                    # Нашли биржи с этой квотой — берём лучшую по дате и выходим
+                    exchange_data.sort(key=lambda x: (x['date'], -x.get('volume', 0)))
+                    break
 
-        results = await asyncio.gather(*tasks)
-        exchange_data = [r for r in results if r is not None]
         if not exchange_data:
             logger.warning('No exchange data found for %s', ticker)
             return None
-
-        exchange_data.sort(key=lambda x: (x['date'], -x.get('volume', 0)))
 
         best = exchange_data[0]
         tied = [r for r in exchange_data if abs((r['date'] - best['date']).total_seconds()) < 86400]
